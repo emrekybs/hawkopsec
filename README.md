@@ -6,7 +6,6 @@
 
 <p align="center">
   <b>One-tap Linux OPSEC hardening & anonymity toolkit</b><br>
-  Tor routing · encrypted DNS · MAC / machine-id spoofing · kernel hardening · trace cleaning — all reversible.
 </p>
 
 <p align="center">
