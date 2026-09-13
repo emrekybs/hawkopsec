@@ -38,6 +38,10 @@ Each mode resets to baseline first, then applies a full profile — switching is
 | **GHOST** | HARDENED + UTC timezone + **system-wide Tor routing** with a leak kill-switch. Full anonymity. |
 | **PARANOID** | GHOST + RAM wipe on shutdown (cold-boot mitigation). Maximum protection. |
 
+## Architectural Structure
+
+<p align="center"><img src="docs/arch.png" alt="Architectural Structure" width="850"></p>
+
 ## Features
 
 - **Network** — Tor transparent proxy (all TCP + DNS via Tor, kill-switch, IPv6 block, stream isolation), DNS-over-TLS (Quad9 / Cloudflare / Mullvad), default-deny firewall, IPv6 disable.
