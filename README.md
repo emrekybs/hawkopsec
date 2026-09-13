@@ -52,12 +52,12 @@ Each mode resets to baseline first, then applies a full profile — switching is
 - **Bilingual UI** — switch English / Türkçe from the top-right; choice is remembered.
 
 <p align="center">
-  <img src="docs/network.png" width="420">
-  <img src="docs/hardening.png" width="420">
+  <img src="docs/network.png" width="850">
+  <img src="docs/hardening.png" width="850">
 </p>
 <p align="center">
-  <img src="docs/identity.png" width="420">
-  <img src="docs/activity.png" width="420">
+  <img src="docs/identity.png" width="850">
+  <img src="docs/activity.png" width="850">
 </p>
 
 ## Install
