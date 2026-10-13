@@ -17,7 +17,7 @@ python3 -m nuitka \
     --assume-yes-for-downloads \
     --enable-plugin=pyqt6 \
     --include-package=hawkopsec \
-    --include-data-dir=assets=assets \
+    --include-data-dir=hawkopsec/assets=hawkopsec/assets \
     --output-dir=build \
     --output-filename=hawkopsec \
     run.py

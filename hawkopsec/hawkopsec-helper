@@ -23,7 +23,8 @@ TORRC  = "/etc/tor/torrc"
 RESOLV = "/etc/resolv.conf"
 LAN_NETS = "192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12"
 
-PANIC_KILL = ["firefox", "firefox-esr", "chrome", "chromium", "chromium-browser",
+PANIC_KILL = ["firefox", "firefox-esr", "firefox.real", "librewolf", "brave", "vivaldi-bin",
+              "chrome", "chromium", "chromium-browser",
               "thunderbird", "signal-desktop", "telegram-desktop", "keepassxc",
               "slack", "discord", "element-desktop"]
 TELE_SVCS  = ["apport.service", "whoopsie.service"]   # Ubuntu; ignored if absent
@@ -147,6 +148,8 @@ table ip hawkopsec_tor {{
   chain output {{
     type nat hook output priority -100; policy accept;
     meta skuid {u} return
+    ip daddr 127.0.0.0/8 udp dport 53 redirect to :5353
+    ip daddr 127.0.0.0/8 tcp dport 53 redirect to :5353
     oif lo return
     ip daddr 127.0.0.0/8 return
     ip daddr {{ {LAN_NETS} }} return
@@ -195,6 +198,7 @@ def tor_on():
                    "SocksPort 127.0.0.1:9050 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth\n"
                    f"{TOR_B}\n")
     log("starting Tor service ...")
+    t_start = time.time() - 2
     rc, _ = run(["systemctl", "enable", "--now", "tor"])
     if rc != 0:
         run(["systemctl", "enable", "--now", "tor@default"])
@@ -217,7 +221,20 @@ def tor_on():
             "Check: systemctl status tor")
         tor_off()
         return 1
-    log("Tor is up.")
+    # TransPort opens long before circuits exist — wait for "Bootstrapped 100%"
+    # so the first IP check after enabling Tor doesn't fail with a timeout.
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t_start))
+    boot = False
+    for i in range(90):
+        rc, out = run(["journalctl", "-q", "--no-pager", "-o", "cat",
+                       "-u", "tor", "-u", "tor@default", "--since", since])
+        pct = [ln for ln in out.splitlines() if "Bootstrapped" in ln]
+        if pct and i % 5 == 0: log("tor: " + pct[-1].split("Bootstrapped", 1)[-1].strip())
+        if any("Bootstrapped 100%" in ln for ln in pct):
+            boot = True; break
+        time.sleep(1)
+    log("Tor is up." if boot else
+        "Tor port is open but bootstrap not confirmed yet — circuits may take a moment.")
     if os.path.islink(RESOLV): os.remove(RESOLV)
     write_file(RESOLV, "# HawkOpsec: DNS via Tor\nnameserver 127.0.0.1\n")
     rc, o = run(["nft", "-f", "-"], input_text=tor_nft())
@@ -537,6 +554,27 @@ def usb_unlock():
     log("USB lockdown lifted."); return 0
 
 
+WEBCAM_CONF = "/etc/modprobe.d/hawkopsec-webcam.conf"
+
+
+def webcam_off():
+    """Unload the UVC webcam driver and block it from loading again."""
+    write_file(WEBCAM_CONF, "# HawkOpsec: webcam disabled\n"
+               "blacklist uvcvideo\ninstall uvcvideo /bin/false\n")
+    rc, o = run(["modprobe", "-r", "uvcvideo"])
+    if rc != 0 and "not found" not in o and glob.glob("/dev/video*"):
+        log("webcam driver is busy — close apps using the camera, then retry. " + o.strip())
+        flag("webcam_off", True); return 1
+    flag("webcam_off", True); log("webcam disabled (uvcvideo unloaded + blocked)."); return 0
+
+
+def webcam_on():
+    if os.path.exists(WEBCAM_CONF): os.remove(WEBCAM_CONF)
+    run(["modprobe", "uvcvideo"])
+    st = load_state(); st.pop("webcam_off", None); save_state(st)
+    log("webcam re-enabled."); return 0
+
+
 NM_MAC_CONF = "/etc/NetworkManager/conf.d/hawkopsec-mac.conf"
 
 
@@ -587,6 +625,8 @@ def ramwipe_off():
 # --------------------------------------------------------------------------- #
 def clean_system():
     run(["journalctl", "--rotate"]); run(["journalctl", "--vacuum-time=1s"])
+    run(["resolvectl", "flush-caches"])          # visited domains in the DNS cache
+    if have("nscd"): run(["nscd", "-i", "hosts"])
     if have("paccache"): run(["paccache", "-rk0"])
     elif have("pacman"): run(["pacman", "-Scc", "--noconfirm"])
     elif have("apt-get"): run(["apt-get", "clean"])
@@ -598,7 +638,7 @@ def clean_system():
     for w in ("/var/log/wtmp", "/var/log/btmp", "/var/log/lastlog"):
         try: open(w, "w").close()
         except OSError: pass
-    log("system journals, coredumps, logins and package cache cleaned."); return 0
+    log("journals, DNS cache, coredumps, logins and package cache cleaned."); return 0
 
 
 JRN_DROPIN = "/etc/systemd/journald.conf.d/hawkopsec.conf"
@@ -674,6 +714,7 @@ def reset_all():
         (nm_mac_off,          st.get("nm_mac")),
         (swap_on,             st.get("swap_off")),
         (bluetooth_on,        st.get("bluetooth_off")),
+        (webcam_on,           st.get("webcam_off")),
         (machineid_restore,   st.get("machineid")),
         (hostname_restore,    st.get("hostname_orig")),
         (tz_restore,          st.get("tz_orig")),
@@ -683,9 +724,13 @@ def reset_all():
         try:
             if cond: fn()
         except Exception as e: log(f"reset step error: {e}")
-    # bring DNS + network back cleanly after restoring originals
-    run(["systemctl", "restart", "systemd-resolved"])
-    run(["systemctl", "restart", "NetworkManager"])
+    # Bring DNS / network back cleanly — but only if we actually touched them.
+    # Restarting NetworkManager unconditionally dropped the link for a few
+    # seconds after every BASELINE switch and broke the follow-up IP check.
+    if st.get("tor") or st.get("dns"):
+        run(["systemctl", "restart", "systemd-resolved"])
+    if st.get("nm_mac") or st.get("mac_orig") or st.get("panic"):
+        run(["systemctl", "restart", "NetworkManager"])
     try:
         shutil.rmtree(BACKUP_DIR, ignore_errors=True)
         if os.path.exists(STATE_FILE): os.remove(STATE_FILE)
@@ -707,6 +752,7 @@ VERBS = {
     "telemetry-off": telemetry_off, "telemetry-restore": telemetry_restore,
     "ipv6-off": ipv6_off, "ipv6-on": ipv6_on,
     "bluetooth-off": bluetooth_off, "bluetooth-on": bluetooth_on,
+    "webcam-off": webcam_off, "webcam-on": webcam_on,
     "swap-off": swap_off, "swap-on": swap_on,
     "usb-lock": usb_lock, "usb-unlock": usb_unlock,
     "nm-mac-on": nm_mac_on, "nm-mac-off": nm_mac_off,

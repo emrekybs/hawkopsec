@@ -27,22 +27,22 @@ install -o root -g root -m 0755 "$ROOT/hawkopsec/hawkopsec-helper" \
 
 echo "[*] Installing assets, fonts, menu icons, policy, desktop entry"
 mkdir -p /usr/local/share/hawkopsec /usr/local/share/hawkopsec/fonts
-install -m 0644 "$ROOT/assets/hawkopsec.png"      /usr/local/share/hawkopsec/hawkopsec.png
-install -m 0644 "$ROOT/assets/hawkopsec_mark.png" /usr/local/share/hawkopsec/hawkopsec_mark.png
-install -m 0644 "$ROOT/assets/hawkopsec_icon.png" /usr/local/share/hawkopsec/hawkopsec_icon.png
-cp "$ROOT/assets/fonts/"*.ttf /usr/local/share/hawkopsec/fonts/ 2>/dev/null || true
-for d in "$ROOT/assets/icons/"*x*/; do
+install -m 0644 "$ROOT/hawkopsec/assets/hawkopsec.png"      /usr/local/share/hawkopsec/hawkopsec.png
+install -m 0644 "$ROOT/hawkopsec/assets/hawkopsec_mark.png" /usr/local/share/hawkopsec/hawkopsec_mark.png
+install -m 0644 "$ROOT/hawkopsec/assets/hawkopsec_icon.png" /usr/local/share/hawkopsec/hawkopsec_icon.png
+cp "$ROOT/hawkopsec/assets/fonts/"*.ttf /usr/local/share/hawkopsec/fonts/ 2>/dev/null || true
+for d in "$ROOT/hawkopsec/assets/icons/"*x*/; do
     sz="$(basename "$d")"
     install -Dm 0644 "$d/hawkopsec.png" "/usr/share/icons/hicolor/$sz/apps/hawkopsec.png"
 done
-install -Dm 0644 "$ROOT/assets/icons/256x256/hawkopsec.png" /usr/share/pixmaps/hawkopsec.png
+install -Dm 0644 "$ROOT/hawkopsec/assets/icons/256x256/hawkopsec.png" /usr/share/pixmaps/hawkopsec.png
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
-install -m 0644 "$ROOT/packaging/com.hawkopsec.helper.policy" \
+install -m 0644 "$ROOT/hawkopsec/data/com.hawkopsec.helper.policy" \
         /usr/share/polkit-1/actions/com.hawkopsec.helper.policy
-install -m 0644 "$ROOT/packaging/hawkopsec.desktop" \
+install -m 0644 "$ROOT/hawkopsec/data/hawkopsec.desktop" \
         /usr/share/applications/hawkopsec.desktop
-install -o root -g root -m 0755 "$ROOT/packaging/uninstall.sh" /usr/local/lib/hawkopsec/uninstall
-install -m 0644 "$ROOT/packaging/hawkopsec-uninstall.desktop" \
+install -o root -g root -m 0755 "$ROOT/hawkopsec/data/uninstall.sh" /usr/local/lib/hawkopsec/uninstall
+install -m 0644 "$ROOT/hawkopsec/data/hawkopsec-uninstall.desktop" \
         /usr/share/applications/hawkopsec-uninstall.desktop
 
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database || true

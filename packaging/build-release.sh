@@ -18,7 +18,7 @@ python3 -m pip install $PIPU --upgrade "nuitka[onefile]" patchelf >/dev/null
 echo "[*] Compiling GUI → single ELF (bundles Qt + JetBrains Mono + logo/icons)…"
 python3 -m nuitka --onefile --assume-yes-for-downloads \
     --enable-plugin=pyqt6 --include-package=hawkopsec \
-    --include-data-dir=assets=assets \
+    --include-data-dir=hawkopsec/assets=hawkopsec/assets \
     --output-dir=build --output-filename=hawkopsec run.py
 
 echo "[*] Compiling root helper → single ELF…"
@@ -30,13 +30,13 @@ echo "[*] Assembling release bundle…"
 install -m0755 build/hawkopsec        "$DIST/hawkopsec"
 install -m0755 build/hawkopsec-helper "$DIST/hawkopsec-helper"
 mkdir -p "$DIST/share"
-cp -r assets/icons "$DIST/share/icons"
-install -m0644 assets/hawkopsec_icon.png             "$DIST/share/hawkopsec_icon.png"
-install -m0644 packaging/com.hawkopsec.helper.policy "$DIST/com.hawkopsec.helper.policy"
-install -m0644 packaging/hawkopsec.desktop           "$DIST/hawkopsec.desktop"
+cp -r hawkopsec/assets/icons "$DIST/share/icons"
+install -m0644 hawkopsec/assets/hawkopsec_icon.png           "$DIST/share/hawkopsec_icon.png"
+install -m0644 hawkopsec/data/com.hawkopsec.helper.policy "$DIST/com.hawkopsec.helper.policy"
+install -m0644 hawkopsec/data/hawkopsec.desktop "$DIST/hawkopsec.desktop"
 install -m0755 packaging/install-release.sh          "$DIST/install.sh"
-install -m0755 packaging/uninstall.sh                "$DIST/uninstall.sh"
-install -m0644 packaging/hawkopsec-uninstall.desktop "$DIST/hawkopsec-uninstall.desktop"
+install -m0755 hawkopsec/data/uninstall.sh         "$DIST/uninstall.sh"
+install -m0644 hawkopsec/data/hawkopsec-uninstall.desktop "$DIST/hawkopsec-uninstall.desktop"
 cp README.md "$DIST/README.md"
 
 ( cd "$OUT" && tar czf "hawkopsec-$VER-$ARCH.tar.gz" "hawkopsec-$VER-$ARCH" )

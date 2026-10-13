@@ -6,7 +6,7 @@
 set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "Run as root:  sudo ./uninstall.sh   (or sudo ./packaging/uninstall.sh)" >&2
+    echo "Run as root:  sudo ./uninstall.sh   (or: sudo hawkopsec-setup --remove)" >&2
     exit 1
 fi
 
@@ -20,6 +20,7 @@ done
 # drop the shutdown RAM-wipe unit if it is still around
 systemctl disable hawkopsec-ramwipe.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/hawkopsec-ramwipe.service
+rm -f /etc/modprobe.d/hawkopsec-webcam.conf
 systemctl daemon-reload >/dev/null 2>&1 || true
 
 echo "[*] Removing binaries and data"
@@ -54,5 +55,6 @@ fi
 rm -rf /root/.config/hawkopsec 2>/dev/null || true
 
 echo
+echo "[i] Installed with pip? Also run:  pip uninstall hawkopsec"
 echo "[✓] HawkOpsec fully removed. If the menu icon still lingers, log out/in "
 echo "    once (some desktops cache the menu until the next session)."

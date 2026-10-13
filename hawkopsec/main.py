@@ -1,5 +1,5 @@
 """HawkOpsec — main window and application entry point."""
-import os, sys, time, json
+import html, os, shutil, sys, time, json
 
 from PyQt6.QtCore import Qt, QRunnable, QThreadPool, QObject, pyqtSignal, QTimer
 from PyQt6.QtGui import QPixmap, QIcon, QFont, QFontDatabase
@@ -11,11 +11,12 @@ from PyQt6.QtWidgets import (
 
 from . import theme as T
 from . import backend
-from .i18n import tr, lang, set_lang, load_lang
+from .i18n import tr, lang, set_lang, load_lang, mode_label
 from .panels import (
     DashboardPanel, NetworkPanel, IdentityPanel, HardeningPanel, TracesPanel,
-    ActivityPanel, MODE_DESC,
+    ActivityPanel, AuditPanel, MODE_DESC,
 )
+from . import audit
 
 
 def _base_dir():
@@ -23,18 +24,16 @@ def _base_dir():
 
 
 def asset_path(name):
-    for p in (os.path.join("/usr/local/share/hawkopsec", name),
-              os.path.join(_base_dir(), "..", "assets", name),
-              os.path.join(_base_dir(), "assets", name)):
+    for p in (os.path.join(_base_dir(), "assets", name),
+              os.path.join("/usr/local/share/hawkopsec", name)):
         if os.path.exists(p):
             return p
     return ""
 
 
 def load_fonts():
-    for d in (os.path.join("/usr/local/share/hawkopsec/fonts"),
-              os.path.join(_base_dir(), "..", "assets", "fonts"),
-              os.path.join(_base_dir(), "assets", "fonts")):
+    for d in (os.path.join(_base_dir(), "assets", "fonts"),
+              "/usr/local/share/hawkopsec/fonts"):
         if os.path.isdir(d):
             for f in os.listdir(d):
                 if f.lower().endswith(".ttf"):
@@ -52,7 +51,8 @@ def mode_sequence(name):
     PUBLIC   = SECURE + [("Persistent MAC", "nm-mac-on"), ("Bluetooth off", "bluetooth-off")]
     HARDENED = PUBLIC + [("Machine-ID", "machineid-random"), ("Hostname", "hostname-random"),
                          ("Swap off", "swap-off"), ("USB lockdown", "usb-lock")]
-    GHOST    = HARDENED + [("Timezone UTC", "tz-utc"), ("Tor routing", "tor-on")]
+    GHOST    = HARDENED + [("Timezone UTC", "tz-utc"), ("Disable webcam", "webcam-off"),
+                           ("Tor routing", "tor-on")]
     PARANOID = GHOST + [("RAM wipe", "ramwipe-on")]
     table = {"BASELINE": [], "SECURE": SECURE, "PUBLIC": PUBLIC,
              "HARDENED": HARDENED, "GHOST": GHOST, "PARANOID": PARANOID}
@@ -84,16 +84,17 @@ MODE_COLOR = {"BASELINE": T.TEXT_MUTED, "SECURE": T.CYAN, "PUBLIC": T.CYAN,
               "HARDENED": T.AMBER, "GHOST": T.RED, "PARANOID": T.RED}
 
 
-NAV = [("DASHBOARD", DashboardPanel), ("NETWORK", NetworkPanel),
-       ("IDENTITY", IdentityPanel), ("HARDENING", HardeningPanel),
-       ("TRACES", TracesPanel), ("ACTIVITY", ActivityPanel)]
+NAV = [("Overview", DashboardPanel), ("Network", NetworkPanel),
+       ("Identity", IdentityPanel), ("Hardening", HardeningPanel),
+       ("Leak test", AuditPanel), ("Traces", TracesPanel), ("Activity", ActivityPanel)]
+AUDIT_IDX = 4
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("HawkOpsec")
-        self.setMinimumSize(980, 700)
+        self.setMinimumSize(1000, 700)
         self.pool = QThreadPool.globalInstance()
         self._queue = []
         self._logo = asset_path("hawkopsec.png")
@@ -106,6 +107,28 @@ class MainWindow(QMainWindow):
         self.refresh_now()
         self.timer = QTimer(self); self.timer.setInterval(4000)
         self.timer.timeout.connect(self.refresh_now); self.timer.start()
+        if not backend.system_integrated():
+            QTimer.singleShot(400, self._offer_setup)
+
+    # -- first run (pip install) ------------------------------------------ #
+    def _offer_setup(self):
+        self.log(tr("System helper not installed — privileged actions are disabled."), "warn")
+        if not self.confirm(tr("Finish installation"),
+                tr("HawkOpsec needs to install its root helper, polkit policy and menu "
+                   "entry once (same as: sudo hawkopsec-setup). Do it now?")):
+            return
+        launcher = shutil.which("hawkopsec") or ""
+        self._dispatch("System setup", lambda: backend.run_setup(launcher))
+
+    def clear_clipboard(self, quiet=False):
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.clear(cb.Mode.Clipboard)
+            if cb.supportsSelection(): cb.clear(cb.Mode.Selection)
+        if quiet:
+            backend.clear_clipboard()
+        else:
+            self.run_callable("Clear clipboard", backend.clear_clipboard)
 
     def _build_central(self):
         root = QWidget(); root.setObjectName("Root")
@@ -129,7 +152,7 @@ class MainWindow(QMainWindow):
     def _topbar(self, logo):
         wrap = QWidget()
         wv = QVBoxLayout(wrap); wv.setContentsMargins(0, 0, 0, 0); wv.setSpacing(0)
-        self.top_accent = QFrame(); self.top_accent.setFixedHeight(3)
+        self.top_accent = QFrame(); self.top_accent.setFixedHeight(2)
         self.top_accent.setStyleSheet(f"background:{T.TEXT_MUTED};")
         wv.addWidget(self.top_accent)
 
@@ -143,8 +166,7 @@ class MainWindow(QMainWindow):
                 84, Qt.TransformationMode.SmoothTransformation))
             pic.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             lay.addWidget(pic, 0, Qt.AlignmentFlag.AlignVCenter)
-            lay.addSpacing(20)
-        lay.addStretch(1)
+            lay.addSpacing(18)
 
         self.nav_group = QButtonGroup(self); self.nav_group.setExclusive(True)
         for i, (name, _) in enumerate(NAV):
@@ -153,8 +175,8 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda _c, idx=i: self._go(idx))
             self.nav_group.addButton(b, i); lay.addWidget(b)
         self.nav_group.button(0).setChecked(True)
-        lay.addStretch(1)
 
+        lay.addStretch(1)
         self.lang_btns = {}
         for code in ("EN", "TR"):
             lb = QPushButton(code); lb.setObjectName("LangBtn"); lb.setCheckable(True)
@@ -163,7 +185,7 @@ class MainWindow(QMainWindow):
             self.lang_btns[code] = lb; lay.addWidget(lb)
         self.lang_btns["TR" if lang() == "tr" else "EN"].setChecked(True)
 
-        un = QPushButton(tr("UNINSTALL")); un.setObjectName("Uninstall")
+        un = QPushButton(tr("Uninstall")); un.setObjectName("Uninstall")
         un.setCursor(Qt.CursorShape.PointingHandCursor)
         un.clicked.connect(self._uninstall)
         lay.addSpacing(8); lay.addWidget(un)
@@ -176,12 +198,12 @@ class MainWindow(QMainWindow):
                 tr("Revert all changes and remove HawkOpsec completely? The app will close.")):
             return
         cand = ["/usr/local/lib/hawkopsec/uninstall",
-                os.path.join(_base_dir(), "..", "packaging", "uninstall.sh")]
+                os.path.join(_base_dir(), "data", "uninstall.sh")]
         script = next((c for c in cand if os.path.exists(c)), None)
         if not script:
             self.log("uninstall script not found", "err"); return
         self.log(tr("Uninstalling — reverting changes and removing files …"), "info")
-        self._dispatch(tr("UNINSTALL"), lambda: backend.run_pkexec(script),
+        self._dispatch("Uninstall", lambda: backend.run_pkexec(script),
                        on_done=lambda rc, out: QApplication.quit())
 
     def _set_accent(self, color):
@@ -192,42 +214,67 @@ class MainWindow(QMainWindow):
                            + f"\nQPushButton#Tab:checked{{border-bottom:2px solid {color};}}")
 
     def _go(self, idx):
-        self.stack.setCurrentIndex(idx); self.refresh_now()
+        self.stack.setCurrentIndex(idx)
+        self.nav_group.button(idx).setChecked(True)
+        self.refresh_now()
+
+    def open_audit(self, run=False):
+        self._go(AUDIT_IDX)
+        if run: self.panels[AUDIT_IDX].run()
 
     # -- console ----------------------------------------------------------- #
     def _console(self):
+        wrap = QWidget(); wrap.setObjectName("ConsoleWrap")
+        v = QVBoxLayout(wrap); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
+        head = QHBoxLayout(); head.setContentsMargins(18, 8, 14, 4)
+        t = QLabel(tr("Console")); t.setObjectName("ConsoleTitle")
+        head.addWidget(t); head.addStretch(1)
+        clr = QPushButton(tr("Clear")); clr.setObjectName("Link")
+        clr.setCursor(Qt.CursorShape.PointingHandCursor)
+        head.addWidget(clr)
+        v.addLayout(head)
         self.console = QPlainTextEdit(); self.console.setObjectName("Console")
-        self.console.setReadOnly(True); self.console.setFixedHeight(132)
-        return self.console
+        self.console.setReadOnly(True); self.console.setFixedHeight(100)
+        clr.clicked.connect(self.console.clear)
+        v.addWidget(self.console)
+        return wrap
 
     def log(self, msg, level="info"):
-        color = {"ok": T.CYAN, "err": T.RED, "info": T.TEXT_MUTED}.get(level, T.TEXT)
+        color = {"ok": T.CYAN, "err": T.RED, "warn": T.AMBER,
+                 "info": T.TEXT_MUTED}.get(level, T.TEXT)
         ts = time.strftime("%H:%M:%S")
+        # escape! raw '<urlopen error …>' used to be eaten as an HTML tag
         self.console.appendHtml(
-            f'<span style="color:{T.TEXT_FAINT}">{ts}</span> '
-            f'<span style="color:{color}">{msg}</span>')
+            f'<span style="color:{T.TEXT_FAINT}">{ts}</span>&nbsp;&nbsp;'
+            f'<span style="color:{color}">{html.escape(str(msg))}</span>')
         sb = self.console.verticalScrollBar(); sb.setValue(sb.maximum())
 
     # -- dispatch ---------------------------------------------------------- #
-    def _dispatch(self, label, fn, on_done=None):
-        self.log(f"▶ {tr(label)} …", "info")
+    def _dispatch(self, label, fn, on_done=None, quiet=False):
+        self.log(f"› {tr(label)} …", "info")
         w = Worker(label, fn)
         w.signals.done.connect(
-            lambda l, rc, out, cb=on_done: self._finished(l, rc, out, cb))
+            lambda l, rc, out, cb=on_done, q=quiet: self._finished(l, rc, out, cb, q))
         self.pool.start(w)
 
-    def _finished(self, label, rc, out, on_done):
-        tail = out.strip().splitlines()[-1] if out.strip() else ""
-        self.log((f"✔ {tr(label)} — " if rc == 0 else f"✗ {tr(label)} — ") + tail,
-                 "ok" if rc == 0 else "err")
+    def _finished(self, label, rc, out, on_done, quiet=False):
+        if not quiet:
+            tail = out.strip().splitlines()[-1] if out.strip() else ""
+            if tail.startswith("[") and "] " in tail[:12]:
+                tail = tail.split("] ", 1)[1]          # drop helper's own timestamp
+            self.log((f"✓ {tr(label)}" if rc == 0 else f"✗ {tr(label)}")
+                     + (f" — {tail}" if tail else ""), "ok" if rc == 0 else "err")
         self.refresh_now()
         if on_done: on_done(rc, out)
 
-    def run_action(self, label, verb, *args):
-        self._dispatch(label, lambda: backend.run_priv(verb, *args))
+    def run_action(self, label, verb, *args, on_done=None, then_check_ip=False):
+        cb = on_done
+        if then_check_ip:
+            cb = lambda rc, out: (rc == 0 and self.check_ip())
+        self._dispatch(label, lambda: backend.run_priv(verb, *args), cb)
 
-    def run_callable(self, label, fn, on_done=None):
-        self._dispatch(label, fn, on_done)
+    def run_callable(self, label, fn, on_done=None, quiet=False):
+        self._dispatch(label, fn, on_done, quiet)
 
     def run_sequence(self, seq, on_complete=None):
         self._queue = list(seq)
@@ -236,7 +283,7 @@ class MainWindow(QMainWindow):
 
     def _seq_next(self, *_):
         if not self._queue:
-            self.log("✔ " + tr("Done."), "ok"); self.refresh_now()
+            self.log("✓ " + tr("Done."), "ok"); self.refresh_now()
             cb = getattr(self, "_seq_done", None)
             if cb:
                 self._seq_done = None; cb()
@@ -247,35 +294,54 @@ class MainWindow(QMainWindow):
                        on_done=self._seq_next)
 
     # -- modes ------------------------------------------------------------- #
-    def apply_mode(self, name):
-        if name != "BASELINE" and not self.confirm(
-                f"{tr('Apply')} {tr(name)}",
+    def apply_mode(self, name, confirm=True):
+        if confirm and not self.confirm(
+                f"{tr('Apply')}: {mode_label(name)}",
                 tr(MODE_DESC.get(name, "")) + "\n\n" + tr("Reset to baseline and apply now?")):
             self.refresh_now(); return
         seq = [("Baseline reset", "reset-all")]
         seq += mode_sequence(name)
         seq.append(("Mode", "set-mode", name))
-        self.log((f"▶ {tr(name)} modu uygulanıyor …" if lang()=="tr"
-                  else f"▶ Applying {name} mode …"), "info")
+        self.log(tr("Applying profile: {m}").format(m=mode_label(name)), "info")
         self.run_sequence(seq, on_complete=self.check_ip)
 
     # -- IP check ---------------------------------------------------------- #
     def check_ip(self):
-        self.log("▶ " + tr("Checking exit IP …"), "info")
+        self.dashboard().set_ip(tr("checking …"), T.TEXT_MUTED)
         def job():
-            return 0, json.dumps(backend.tor_check())
+            res = backend.ip_check()
+            if "error" not in res:
+                audit.maybe_store_real_fp(res, backend.read_state())
+            return 0, json.dumps(res)
         def done(rc, out):
-            res = json.loads(out); dash = self.panels[0]
+            try:
+                res = json.loads(out)
+            except ValueError:
+                res = {"error": out.strip()[-200:] or "unknown"}
             if "error" in res:
-                dash.set_ip("UNREACHABLE", T.PARTIAL)
-                self.log(f"✗ {tr('IP check failed')} — " + res["error"], "err")
+                self.dashboard().set_ip(tr("Unreachable"), T.PARTIAL,
+                                        "\n".join(res.get("tried", [])))
+                self.log(f"✗ {tr('IP check failed')} — {tr(res['error'])}", "err")
+                for t in res.get("tried", [])[:-1]:
+                    self.log(f"    {t}", "info")
             else:
-                is_tor = res.get("is_tor")
-                dash.set_ip(res.get("ip", "?"), T.SECURED if is_tor else T.EXPOSED)
-                self.log(f"✔ {tr('Exit IP')} {res.get('ip')} — "
-                         + (tr("Tor confirmed") if is_tor else tr("NOT via Tor")),
-                         "ok" if is_tor else "err")
-        self._dispatch("IP check", job, on_done=done)
+                self.show_ip(res, log=True)
+        self._dispatch("Checking exit IP", job, on_done=done, quiet=True)
+
+    def show_ip(self, res, log=False):
+        is_tor = res.get("is_tor")
+        where = " · ".join(x for x in (res.get("country"), res.get("org")) if x)
+        color = T.SECURED if is_tor else (T.PARTIAL if is_tor is None else T.EXPOSED)
+        self.dashboard().set_ip(res.get("ip", "?"), color, where)
+        if log:
+            status = (tr("Tor confirmed") if is_tor else
+                      tr("Tor status unknown") if is_tor is None else tr("NOT via Tor"))
+            self.log(f"✓ {tr('Exit IP')} {res.get('ip')}"
+                     + (f" ({where})" if where else "") + f" — {status}",
+                     "ok" if is_tor else ("warn" if is_tor is None else "err"))
+
+    def dashboard(self):
+        return self.panels[0]
 
     # -- helpers ----------------------------------------------------------- #
     def confirm(self, title, text):
@@ -304,7 +370,9 @@ def main():
     app.setApplicationName("HawkOpsec")
     load_lang()
     load_fonts()
-    app.setFont(QFont("JetBrains Mono", 10))
+    f = QFont(T.SANS_FAMILY); f.setPixelSize(13)
+    f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+    app.setFont(f)
     win = MainWindow(); win.show()
     sys.exit(app.exec())
 

@@ -23,28 +23,28 @@ install -o root -g root -m 0755 "$ROOT/hawkopsec/hawkopsec-helper" \
 
 echo "[*] Installing assets, fonts and menu icons"
 mkdir -p "$SHAREDIR" "$SHAREDIR/fonts"
-install -m 0644 "$ROOT/assets/hawkopsec.png"      "$SHAREDIR/hawkopsec.png"
-install -m 0644 "$ROOT/assets/hawkopsec_mark.png" "$SHAREDIR/hawkopsec_mark.png"
-install -m 0644 "$ROOT/assets/hawkopsec_icon.png" "$SHAREDIR/hawkopsec_icon.png"
-cp "$ROOT/assets/fonts/"*.ttf "$SHAREDIR/fonts/" 2>/dev/null || true
-for d in "$ROOT/assets/icons/"*x*/; do
+install -m 0644 "$ROOT/hawkopsec/assets/hawkopsec.png"      "$SHAREDIR/hawkopsec.png"
+install -m 0644 "$ROOT/hawkopsec/assets/hawkopsec_mark.png" "$SHAREDIR/hawkopsec_mark.png"
+install -m 0644 "$ROOT/hawkopsec/assets/hawkopsec_icon.png" "$SHAREDIR/hawkopsec_icon.png"
+cp "$ROOT/hawkopsec/assets/fonts/"*.ttf "$SHAREDIR/fonts/" 2>/dev/null || true
+for d in "$ROOT/hawkopsec/assets/icons/"*x*/; do
     sz="$(basename "$d")"
     install -Dm 0644 "$d/hawkopsec.png" "/usr/share/icons/hicolor/$sz/apps/hawkopsec.png"
 done
-install -Dm 0644 "$ROOT/assets/icons/256x256/hawkopsec.png" /usr/share/pixmaps/hawkopsec.png
+install -Dm 0644 "$ROOT/hawkopsec/assets/icons/256x256/hawkopsec.png" /usr/share/pixmaps/hawkopsec.png
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
 
 echo "[*] Installing polkit policy"
-install -m 0644 "$ROOT/packaging/com.hawkopsec.helper.policy" \
+install -m 0644 "$ROOT/hawkopsec/data/com.hawkopsec.helper.policy" \
         /usr/share/polkit-1/actions/com.hawkopsec.helper.policy
 
 echo "[*] Installing desktop entry"
-install -m 0644 "$ROOT/packaging/hawkopsec.desktop" \
+install -m 0644 "$ROOT/hawkopsec/data/hawkopsec.desktop" \
         /usr/share/applications/hawkopsec.desktop
 
 echo "[*] Installing uninstaller (menu entry)"
-install -o root -g root -m 0755 "$ROOT/packaging/uninstall.sh" "$LIBDIR/uninstall"
-install -m 0644 "$ROOT/packaging/hawkopsec-uninstall.desktop" \
+install -o root -g root -m 0755 "$ROOT/hawkopsec/data/uninstall.sh" "$LIBDIR/uninstall"
+install -m 0644 "$ROOT/hawkopsec/data/hawkopsec-uninstall.desktop" \
         /usr/share/applications/hawkopsec-uninstall.desktop
 
 echo "[*] Creating launcher /usr/local/bin/hawkopsec"
