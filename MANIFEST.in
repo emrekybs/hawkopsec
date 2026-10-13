@@ -1,8 +1,0 @@
-include README.md LICENSE pyproject.toml
-include hawkopsec/hawkopsec-helper
-recursive-include hawkopsec/assets *.png *.ttf *.txt
-recursive-include hawkopsec/data *
-prune docs
-prune packaging
-prune build
-prune release
