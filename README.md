@@ -36,7 +36,7 @@ sudo "$(command -v hawkopsec-setup)"
 hawkopsec
 ```
 
-**From GitHub (one command)**
+**From Source
 
 ```bash
 # Debian / Ubuntu / Kali / Mint
