@@ -23,34 +23,29 @@ and checks for DNS / IP leaks — **Reset system** rolls everything back.
 
 ## Install
 
-System packages:
+**With pipx**
 
 ```bash
 # Debian / Ubuntu / Kali / Mint
 sudo apt install -y pipx tor nftables policykit-1 iproute2 rfkill
 # Arch
 sudo pacman -S --needed python-pipx tor nftables polkit iproute2 rfkill
-```
 
-**With pipx**
-
-```bash
 pipx install hawkopsec
 sudo "$(command -v hawkopsec-setup)"
 hawkopsec
 ```
 
-**Without pipx**
+**From GitHub (one command)**
 
 ```bash
-python3 -m venv ~/.hawkopsec
-~/.hawkopsec/bin/pip install hawkopsec
-sudo ~/.hawkopsec/bin/hawkopsec-setup
-~/.hawkopsec/bin/hawkopsec
+# Debian / Ubuntu / Kali / Mint
+sudo apt install -y git python3-pyqt6 tor nftables policykit-1 iproute2 rfkill && git clone https://github.com/emrekybs/hawkopsec.git && cd hawkopsec && sudo ./packaging/install.sh && hawkopsec
+# Arch
+sudo pacman -S --needed git python-pyqt6 tor nftables polkit iproute2 rfkill && git clone https://github.com/emrekybs/hawkopsec.git && cd hawkopsec && sudo ./packaging/install.sh && hawkopsec
 ```
 
-`hawkopsec-setup` runs once: it installs the root helper, polkit policy and menu entry.
-After that, start HawkOpsec from the application menu.
+After installing, start HawkOpsec from the application menu or run `hawkopsec`.
 
 ## License
 
