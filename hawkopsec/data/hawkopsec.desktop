@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=HawkOpsec
+GenericName=OPSEC Hardening
+Comment=Harden Linux OPSEC — Tor routing, DNS, MAC, firewall, trace cleaning
+Exec=hawkopsec
+Icon=hawkopsec
+Terminal=false
+Categories=System;Security;Network;
+Keywords=opsec;privacy;tor;anonymity;security;hardening;mac;firewall;
+StartupNotify=true

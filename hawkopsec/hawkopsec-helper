@@ -1,0 +1,834 @@
+#!/usr/bin/env python3
+"""
+HawkOpsec privileged helper — runs as root via pkexec/polkit.
+
+Primary target: Arch Linux (systemd, tor.service, nftables). Debian/Ubuntu is
+handled where it differs. Every mutating action snapshots the original state
+into /var/lib/hawkopsec before touching the system and records an on/off flag in
+a world-readable state.json, so the unprivileged GUI can show status and
+`reset-all` can return the machine to exactly its pre-HawkOpsec state — even
+after a reboot.
+
+Usage:  hawkopsec-helper <verb> [args...]
+"""
+import json, os, shutil, subprocess, sys, time, random, secrets, pwd, glob
+
+STATE_DIR  = "/var/lib/hawkopsec"
+BACKUP_DIR = os.path.join(STATE_DIR, "backup")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+LOG_FILE   = os.path.join(STATE_DIR, "helper.log")
+
+TOR_A, TOR_B = "# >>> HAWKOPSEC >>>", "# <<< HAWKOPSEC <<<"
+TORRC  = "/etc/tor/torrc"
+RESOLV = "/etc/resolv.conf"
+LAN_NETS = "192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12"
+
+PANIC_KILL = ["firefox", "firefox-esr", "firefox.real", "librewolf", "brave", "vivaldi-bin",
+              "chrome", "chromium", "chromium-browser",
+              "thunderbird", "signal-desktop", "telegram-desktop", "keepassxc",
+              "slack", "discord", "element-desktop"]
+TELE_SVCS  = ["apport.service", "whoopsie.service"]   # Ubuntu; ignored if absent
+
+DNS_RESOLVERS = {
+    "quad9":      ("9.9.9.9", "dns.quad9.net"),
+    "cloudflare": ("1.1.1.1", "cloudflare-dns.com"),
+    "mullvad":    ("194.242.2.2", "dns.mullvad.net"),
+}
+
+
+# --------------------------------------------------------------------------- #
+def log(msg):
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a") as f: f.write(line + "\n")
+    except OSError: pass
+
+
+def run(cmd, input_text=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, input=input_text)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError:
+        return 127, f"not found: {cmd[0]}"
+
+
+def have(b): return shutil.which(b) is not None
+
+
+def ensure_dirs():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    os.chmod(STATE_DIR, 0o755)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f: return json.load(f)
+    except (OSError, json.JSONDecodeError): return {}
+
+
+def save_state(st):
+    ensure_dirs()
+    with open(STATE_FILE, "w") as f: json.dump(st, f, indent=2)
+    os.chmod(STATE_FILE, 0o644)
+
+
+def flag(key, value=None):
+    st = load_state()
+    if value is None and key not in st: return None
+    if value is None: return st.get(key)
+    st[key] = value; save_state(st)
+
+
+def _bp(path): return os.path.join(BACKUP_DIR, path.lstrip("/").replace("/", "__"))
+
+
+def backup_file(path):
+    ensure_dirs()
+    st = load_state(); backups = st.setdefault("_backups", {})
+    if path in backups: return
+    meta = {"backup": _bp(path)}
+    if os.path.islink(path): meta["symlink"] = os.readlink(path)
+    elif os.path.exists(path): shutil.copy2(path, _bp(path))
+    else: meta["absent"] = True
+    backups[path] = meta; save_state(st)
+
+
+def restore_file(path):
+    st = load_state(); meta = st.get("_backups", {}).get(path)
+    if not meta: return
+    try:
+        if os.path.islink(path) or os.path.isfile(path): os.remove(path)
+    except OSError: pass
+    if meta.get("absent"): pass
+    elif meta.get("symlink"):
+        try: os.symlink(meta["symlink"], path)
+        except OSError: pass
+    elif os.path.exists(meta["backup"]): shutil.copy2(meta["backup"], path)
+    st["_backups"].pop(path, None); save_state(st)
+
+
+def write_file(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f: f.write(content)
+
+
+def tor_user():
+    for u in ("tor", "debian-tor", "_tor"):
+        try: pwd.getpwnam(u); return u
+        except KeyError: continue
+    return "tor"
+
+
+def tor_restart():
+    rc, _ = run(["systemctl", "restart", "tor.service"])
+    if rc != 0: run(["systemctl", "restart", "tor@default"])
+
+
+VIRT_IFACE_PREFIXES = ("lo", "docker", "veth", "br-", "virbr", "vmnet", "vboxnet",
+                       "tun", "tap", "wg", "tailscale", "zt", "ifb", "dummy",
+                       "sit", "gre", "bond", "kube", "cni", "flannel")
+
+
+def _real_iface(name):
+    return not any(name == p or name.startswith(p) for p in VIRT_IFACE_PREFIXES)
+
+
+def net_ifaces():
+    return [n for n in sorted(os.listdir("/sys/class/net")) if _real_iface(n)]
+
+
+# --------------------------------------------------------------------------- #
+#  TOR transparent proxy + kill-switch
+# --------------------------------------------------------------------------- #
+def tor_nft():
+    u = tor_user()
+    return f"""
+table ip hawkopsec_tor {{
+  chain output {{
+    type nat hook output priority -100; policy accept;
+    meta skuid {u} return
+    ip daddr 127.0.0.0/8 udp dport 53 redirect to :5353
+    ip daddr 127.0.0.0/8 tcp dport 53 redirect to :5353
+    oif lo return
+    ip daddr 127.0.0.0/8 return
+    ip daddr {{ {LAN_NETS} }} return
+    udp dport 53 redirect to :5353
+    tcp dport 53 redirect to :5353
+    meta l4proto tcp redirect to :9040
+  }}
+}}
+table ip hawkopsec_torfw {{
+  chain output {{
+    type filter hook output priority 0; policy drop;
+    meta skuid {u} accept
+    oif lo accept
+    ct state established,related accept
+    ip daddr 127.0.0.1 accept
+    ip daddr {{ {LAN_NETS} }} accept
+  }}
+}}
+table ip6 hawkopsec_tor6 {{
+  chain input {{
+    type filter hook input priority 0; policy drop;
+    iif lo accept
+  }}
+  chain output {{
+    type filter hook output priority 0; policy drop;
+    oif lo accept
+  }}
+  chain forward {{
+    type filter hook forward priority 0; policy drop;
+  }}
+}}
+"""
+
+
+def tor_on():
+    if not have("tor"): log("ERROR: tor not installed (pacman -S tor)"); return 1
+    if not have("nft"): log("ERROR: nftables not installed (pacman -S nftables)"); return 1
+    backup_file(TORRC); backup_file(RESOLV)
+    st = load_state()
+    if "tor_prev" not in st:
+        _, en = run(["systemctl", "is-enabled", "tor"])
+        _, act = run(["systemctl", "is-active", "tor"])
+        _, ract = run(["systemctl", "is-active", "systemd-resolved"])
+        st["tor_prev"] = {"enabled": en.strip() in ("enabled", "enabled-runtime"),
+                          "active": act.strip() == "active",
+                          "resolved": ract.strip() == "active"}
+        save_state(st)
+    txt = open(TORRC).read() if os.path.exists(TORRC) else ""
+    if TOR_A not in txt:
+        write_file(TORRC, txt + f"\n{TOR_A}\n"
+                   "VirtualAddrNetworkIPv4 10.192.0.0/10\n"
+                   "AutomapHostsOnResolve 1\n"
+                   "TransPort 127.0.0.1:9040 IsolateClientAddr IsolateClientProtocol IsolateDestAddr IsolateDestPort\n"
+                   "DNSPort 127.0.0.1:5353\n"
+                   "SocksPort 127.0.0.1:9050 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth\n"
+                   f"{TOR_B}\n")
+    log("starting Tor service ...")
+    t_start = time.time() - 2
+    rc, _ = run(["systemctl", "enable", "--now", "tor"])
+    if rc != 0:
+        run(["systemctl", "enable", "--now", "tor@default"])
+    run(["systemctl", "restart", "tor"]) if rc == 0 else run(["systemctl", "restart", "tor@default"])
+    # wait until Tor's TransPort is actually listening, else we'd cut the network
+    import socket
+    up = False
+    for _ in range(40):
+        sk = socket.socket(); sk.settimeout(0.4)
+        try:
+            sk.connect(("127.0.0.1", 9040)); up = True
+        except OSError:
+            time.sleep(0.5)
+        finally:
+            try: sk.close()
+            except OSError: pass
+        if up: break
+    if not up:
+        log("ERROR: Tor did not come up (TransPort 9040). Rolling back; network intact. "
+            "Check: systemctl status tor")
+        tor_off()
+        return 1
+    # TransPort opens long before circuits exist — wait for "Bootstrapped 100%"
+    # so the first IP check after enabling Tor doesn't fail with a timeout.
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t_start))
+    boot = False
+    for i in range(90):
+        rc, out = run(["journalctl", "-q", "--no-pager", "-o", "cat",
+                       "-u", "tor", "-u", "tor@default", "--since", since])
+        pct = [ln for ln in out.splitlines() if "Bootstrapped" in ln]
+        if pct and i % 5 == 0: log("tor: " + pct[-1].split("Bootstrapped", 1)[-1].strip())
+        if any("Bootstrapped 100%" in ln for ln in pct):
+            boot = True; break
+        time.sleep(1)
+    log("Tor is up." if boot else
+        "Tor port is open but bootstrap not confirmed yet — circuits may take a moment.")
+    # systemd-resolved (nss-resolve) refuses .onion and would bypass resolv.conf;
+    # stop it so glibc falls back to resolv.conf -> 127.0.0.1 -> Tor DNSPort.
+    if load_state().get("tor_prev", {}).get("resolved"):
+        run(["systemctl", "stop", "systemd-resolved"])
+    if os.path.islink(RESOLV): os.remove(RESOLV)
+    write_file(RESOLV, "# HawkOpsec: DNS via Tor\nnameserver 127.0.0.1\n")
+    rc, o = run(["nft", "-f", "-"], input_text=tor_nft())
+    if rc != 0:
+        log("nft error, rolling back: " + o)
+        tor_off()
+        return 1
+    flag("tor", True); log("TOR transparent proxy ACTIVE.")
+    return 0
+
+
+def tor_off():
+    for t in ("ip hawkopsec_tor", "ip hawkopsec_torfw", "ip6 hawkopsec_tor6"):
+        run(["nft", "delete", "table"] + t.split())
+    if os.path.exists(TORRC):
+        txt = open(TORRC).read()
+        if TOR_A in txt:
+            pre = txt.split(TOR_A)[0]
+            post = txt.split(TOR_B)[-1] if TOR_B in txt else ""
+            write_file(TORRC, pre.rstrip() + "\n" + post.lstrip())
+    st = load_state(); prev = st.get("tor_prev", {})
+    if prev.get("resolved") or st.get("dns"):
+        run(["systemctl", "start", "systemd-resolved"])
+    if st.get("dns") and os.path.exists(STUB):
+        # DoT profile still active: point back at resolved, not at the pre-DoT file
+        try:
+            if os.path.lexists(RESOLV): os.remove(RESOLV)
+            os.symlink(STUB, RESOLV)
+        except OSError: pass
+    else:
+        restore_file(RESOLV)
+    if not prev or prev.get("active") or prev.get("enabled"):   # unknown (old state) -> keep
+        tor_restart()                       # was in use before: keep it, drop our config
+        if not prev.get("enabled"): run(["systemctl", "disable", "tor"])
+    else:
+        run(["systemctl", "disable", "--now", "tor"])
+        run(["systemctl", "disable", "--now", "tor@default"])
+    st = load_state(); st.pop("tor_prev", None); st["tor"] = False; save_state(st)
+    log("TOR disabled, resolver restored.")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+#  DNS-over-TLS
+# --------------------------------------------------------------------------- #
+DNS_DROPIN = "/etc/systemd/resolved.conf.d/hawkopsec.conf"
+STUB = "/run/systemd/resolve/stub-resolv.conf"
+
+
+def dns_set(mode):
+    if mode not in DNS_RESOLVERS: log(f"unknown resolver {mode}"); return 1
+    ip, sni = DNS_RESOLVERS[mode]
+    rc, _ = run(["systemctl", "cat", "systemd-resolved.service"])
+    if rc != 0:
+        log("ERROR: systemd-resolved not installed — DNS-over-TLS needs it "
+            "(Debian: apt install systemd-resolved). DNS left unchanged."); return 1
+    st = load_state()
+    if "resolved_prev" not in st:
+        _, en = run(["systemctl", "is-enabled", "systemd-resolved"])
+        st["resolved_prev"] = en.strip() in ("enabled", "enabled-runtime"); save_state(st)
+    backup_file(DNS_DROPIN); backup_file(RESOLV)
+    write_file(DNS_DROPIN, "[Resolve]\n"
+               f"DNS={ip}#{sni}\nDNSOverTLS=yes\nDNSSEC=allow-downgrade\nDomains=~.\n")
+    run(["systemctl", "enable", "systemd-resolved"])
+    rc, o = run(["systemctl", "restart", "systemd-resolved"])
+    for _ in range(20):
+        if os.path.exists(STUB): break
+        time.sleep(0.25)
+    if rc != 0 or not os.path.exists(STUB):
+        log("ERROR: systemd-resolved did not start — rolling back. " + o.strip())
+        dns_restore(); return 1
+    try:
+        if os.path.lexists(RESOLV): os.remove(RESOLV)
+        os.symlink(STUB, RESOLV)
+    except OSError as e:
+        log(f"could not link {RESOLV}: {e}")
+    flag("dns", mode); log(f"DNS-over-TLS via {mode} ({ip}).")
+    return 0
+
+
+def dns_restore():
+    restore_file(DNS_DROPIN); restore_file(RESOLV)
+    st = load_state()
+    if st.get("resolved_prev") is False:
+        run(["systemctl", "disable", "--now", "systemd-resolved"])
+    else:
+        run(["systemctl", "restart", "systemd-resolved"])
+    st = load_state(); st.pop("dns", None); st.pop("resolved_prev", None); save_state(st)
+    log("DNS restored."); return 0
+
+
+# --------------------------------------------------------------------------- #
+#  MAC / hostname / timezone / machine-id
+# --------------------------------------------------------------------------- #
+def _rand_mac():
+    first = (random.randint(0, 255) & 0xFE) | 0x02
+    return ":".join(["%02x" % first] + ["%02x" % random.randint(0, 255) for _ in range(5)])
+
+
+def mac_random(iface):
+    ap = f"/sys/class/net/{iface}/address"
+    if not os.path.exists(ap): log(f"no such interface {iface}"); return 1
+    st = load_state(); orig = st.setdefault("mac_orig", {})
+    if iface not in orig: orig[iface] = open(ap).read().strip(); save_state(st)
+    new = _rand_mac()
+    run(["ip", "link", "set", "dev", iface, "down"])
+    rc, o = run(["ip", "link", "set", "dev", iface, "address", new])
+    run(["ip", "link", "set", "dev", iface, "up"])
+    if rc != 0: log(f"MAC set failed on {iface}: {o}"); return 1
+    st = load_state(); st.setdefault("mac_spoofed", {})[iface] = new; save_state(st)
+    log(f"{iface} MAC -> {new}"); return 0
+
+
+def mac_restore(iface):
+    st = load_state(); orig = st.get("mac_orig", {}).get(iface)
+    if not orig: return 0
+    run(["ip", "link", "set", "dev", iface, "down"])
+    run(["ip", "link", "set", "dev", iface, "address", orig])
+    run(["ip", "link", "set", "dev", iface, "up"])
+    st.get("mac_spoofed", {}).pop(iface, None); st["mac_orig"].pop(iface, None)
+    save_state(st); log(f"{iface} MAC restored -> {orig}"); return 0
+
+
+def mac_restore_all():
+    for i in list(load_state().get("mac_orig", {}).keys()): mac_restore(i)
+    return 0
+
+
+def hostname_random():
+    st = load_state()
+    if "hostname_orig" not in st:
+        rc, cur = run(["hostnamectl", "--static", "hostname"])
+        st["hostname_orig"] = cur.strip() or (open("/etc/hostname").read().strip()
+                                              if os.path.exists("/etc/hostname") else "localhost")
+        save_state(st)
+    new = "wks-" + "".join(random.choice("0123456789abcdef") for _ in range(6))
+    run(["hostnamectl", "set-hostname", new]); flag("hostname", new)
+    log(f"hostname -> {new}"); return 0
+
+
+def hostname_restore():
+    st = load_state(); orig = st.get("hostname_orig")
+    if orig:
+        run(["hostnamectl", "set-hostname", orig])
+        st.pop("hostname_orig", None); st.pop("hostname", None); save_state(st)
+        log(f"hostname restored -> {orig}")
+    return 0
+
+
+def tz_utc():
+    st = load_state()
+    if "tz_orig" not in st:
+        rc, cur = run(["timedatectl", "show", "-p", "Timezone", "--value"])
+        st["tz_orig"] = cur.strip() or "Etc/UTC"; save_state(st)
+    run(["timedatectl", "set-timezone", "UTC"]); flag("tz", True)
+    log("timezone -> UTC"); return 0
+
+
+def tz_restore():
+    st = load_state(); orig = st.get("tz_orig")
+    if orig:
+        run(["timedatectl", "set-timezone", orig])
+        st.pop("tz_orig", None); st.pop("tz", None); save_state(st)
+        log(f"timezone restored -> {orig}")
+    return 0
+
+
+MACHINE_ID = "/etc/machine-id"
+DBUS_ID    = "/var/lib/dbus/machine-id"
+
+
+def machineid_random():
+    backup_file(MACHINE_ID)
+    if os.path.exists(DBUS_ID): backup_file(DBUS_ID)
+    new = secrets.token_hex(16)
+    write_file(MACHINE_ID, new + "\n")
+    if os.path.exists(DBUS_ID) and not os.path.islink(DBUS_ID):
+        write_file(DBUS_ID, new + "\n")
+    flag("machineid", True); log(f"machine-id -> {new}"); return 0
+
+
+def machineid_restore():
+    restore_file(MACHINE_ID)
+    if os.path.exists(_bp(DBUS_ID)) or True: restore_file(DBUS_ID)
+    st = load_state(); st.pop("machineid", None); save_state(st)
+    log("machine-id restored."); return 0
+
+
+# --------------------------------------------------------------------------- #
+#  Kernel hardening / firewall / IPv6
+# --------------------------------------------------------------------------- #
+SYSCTL_FILE = "/etc/sysctl.d/99-hawkopsec.conf"
+SYSCTL_BODY = """# HawkOpsec kernel hardening
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.all.log_martians=1
+net.ipv4.tcp_syncookies=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.ip_forward=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.all.accept_source_route=0
+kernel.kptr_restrict=2
+kernel.dmesg_restrict=1
+kernel.yama.ptrace_scope=2
+kernel.randomize_va_space=2
+kernel.unprivileged_bpf_disabled=1
+net.core.bpf_jit_harden=2
+kernel.kexec_load_disabled=1
+kernel.perf_event_paranoid=3
+fs.protected_hardlinks=1
+fs.protected_symlinks=1
+fs.protected_fifos=2
+fs.protected_regular=2
+fs.suid_dumpable=0
+"""
+
+
+def harden_sysctl():
+    write_file(SYSCTL_FILE, SYSCTL_BODY); run(["sysctl", "--system"])
+    flag("sysctl", True); log("kernel hardening applied."); return 0
+
+
+def unharden_sysctl():
+    if os.path.exists(SYSCTL_FILE): os.remove(SYSCTL_FILE)
+    flag("sysctl", False); log("kernel hardening removed (values reset on reboot)."); return 0
+
+
+def firewall_on():
+    if not have("nft"): log("nftables missing"); return 1
+    rules = """
+table inet hawkopsec_fw {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    iif lo accept
+    ct state established,related accept
+    ct state invalid drop
+    ip protocol icmp icmp type echo-request limit rate 5/second accept
+    ip6 nexthdr icmpv6 accept
+  }
+  chain forward { type filter hook forward priority 0; policy drop; }
+  chain output  { type filter hook output  priority 0; policy accept; }
+}
+"""
+    rc, o = run(["nft", "-f", "-"], input_text=rules)
+    if rc != 0: log("nft error: " + o); return 1
+    flag("firewall", True); log("firewall active — default-deny inbound."); return 0
+
+
+def firewall_off():
+    run(["nft", "delete", "table", "inet", "hawkopsec_fw"])
+    flag("firewall", False); log("firewall disabled."); return 0
+
+
+IPV6_FILE = "/etc/sysctl.d/98-hawkopsec-ipv6.conf"
+
+
+def ipv6_off():
+    write_file(IPV6_FILE, "net.ipv6.conf.all.disable_ipv6=1\n"
+               "net.ipv6.conf.default.disable_ipv6=1\nnet.ipv6.conf.lo.disable_ipv6=1\n")
+    run(["sysctl", "--system"]); flag("ipv6_off", True); log("IPv6 disabled."); return 0
+
+
+def ipv6_on():
+    if os.path.exists(IPV6_FILE): os.remove(IPV6_FILE)
+    for s in ("all", "default", "lo"):
+        run(["sysctl", "-w", f"net.ipv6.conf.{s}.disable_ipv6=0"])
+    flag("ipv6_off", False); log("IPv6 re-enabled."); return 0
+
+
+# --------------------------------------------------------------------------- #
+#  Crash reporting / coredumps  (distro-aware)
+# --------------------------------------------------------------------------- #
+COREDUMP_DROPIN = "/etc/systemd/coredump.conf.d/hawkopsec.conf"
+
+
+def telemetry_off():
+    st = load_state(); prev = st.setdefault("tele_prev", {})
+    for svc in TELE_SVCS:
+        rc, en = run(["systemctl", "is-enabled", svc])
+        if "not-found" not in en:
+            prev[svc] = en.strip()
+            run(["systemctl", "disable", "--now", svc])
+    save_state(st)
+    backup_file(COREDUMP_DROPIN)
+    write_file(COREDUMP_DROPIN, "[Coredump]\nStorage=none\nProcessSizeMax=0\n")
+    run(["systemctl", "daemon-reload"])
+    if os.path.exists("/etc/default/apport"):
+        backup_file("/etc/default/apport"); write_file("/etc/default/apport", "enabled=0\n")
+    flag("telemetry", True); log("crash reporting / coredumps disabled."); return 0
+
+
+def telemetry_restore():
+    st = load_state()
+    for svc, en in st.get("tele_prev", {}).items():
+        if en in ("enabled", "enabled-runtime", "static"):
+            run(["systemctl", "enable", "--now", svc])
+    restore_file(COREDUMP_DROPIN); restore_file("/etc/default/apport")
+    run(["systemctl", "daemon-reload"])
+    st.pop("tele_prev", None); st.pop("telemetry", None); save_state(st)
+    log("crash reporting restored."); return 0
+
+
+# --------------------------------------------------------------------------- #
+#  Bluetooth / swap / USB lock  (new OPSEC modules)
+# --------------------------------------------------------------------------- #
+def bluetooth_off():
+    st = load_state()
+    rc, act = run(["systemctl", "is-active", "bluetooth.service"])
+    st["bt_was_active"] = (act.strip() == "active"); save_state(st)
+    run(["rfkill", "block", "bluetooth"])
+    run(["systemctl", "stop", "bluetooth.service"])
+    flag("bluetooth_off", True); log("Bluetooth blocked."); return 0
+
+
+def bluetooth_on():
+    run(["rfkill", "unblock", "bluetooth"])
+    st = load_state()
+    if st.get("bt_was_active"): run(["systemctl", "start", "bluetooth.service"])
+    st.pop("bt_was_active", None); st.pop("bluetooth_off", None); save_state(st)
+    log("Bluetooth unblocked."); return 0
+
+
+def swap_off():
+    run(["swapoff", "-a"]); flag("swap_off", True)
+    log("swap disabled (prevents secrets leaking to disk)."); return 0
+
+
+def swap_on():
+    run(["swapon", "-a"]); flag("swap_off", False); log("swap re-enabled."); return 0
+
+
+def usb_lock():
+    st = load_state(); prev = st.setdefault("usb_prev", {})
+    for f in glob.glob("/sys/bus/usb/devices/usb*/authorized_default"):
+        try:
+            prev[f] = open(f).read().strip()
+            with open(f, "w") as h: h.write("0")
+        except OSError: pass
+    save_state(st); flag("usb_lock", True)
+    log("USB lockdown — new devices blocked (existing keep working)."); return 0
+
+
+def usb_unlock():
+    st = load_state()
+    for f, v in st.get("usb_prev", {}).items():
+        try:
+            with open(f, "w") as h: h.write(v or "1")
+        except OSError: pass
+    st.pop("usb_prev", None); st.pop("usb_lock", None); save_state(st)
+    log("USB lockdown lifted."); return 0
+
+
+WEBCAM_CONF = "/etc/modprobe.d/hawkopsec-webcam.conf"
+
+
+def webcam_off():
+    """Unload the UVC webcam driver and block it from loading again."""
+    write_file(WEBCAM_CONF, "# HawkOpsec: webcam disabled\n"
+               "blacklist uvcvideo\ninstall uvcvideo /bin/false\n")
+    rc, o = run(["modprobe", "-r", "uvcvideo"])
+    if rc != 0 and "not found" not in o and glob.glob("/dev/video*"):
+        log("webcam driver is busy — close apps using the camera, then retry. " + o.strip())
+        return 1
+    flag("webcam_off", True); log("webcam disabled (uvcvideo unloaded + blocked)."); return 0
+
+
+def webcam_on():
+    if os.path.exists(WEBCAM_CONF): os.remove(WEBCAM_CONF)
+    run(["modprobe", "uvcvideo"])
+    st = load_state(); st.pop("webcam_off", None); save_state(st)
+    log("webcam re-enabled."); return 0
+
+
+NM_MAC_CONF = "/etc/NetworkManager/conf.d/hawkopsec-mac.conf"
+
+
+def nm_mac_on():
+    if not os.path.isdir("/etc/NetworkManager"):
+        log("NetworkManager not present; skipping."); return 1
+    write_file(NM_MAC_CONF,
+               "[device]\nwifi.scan-rand-mac-address=yes\n\n"
+               "[connection]\nwifi.cloned-mac-address=random\n"
+               "ethernet.cloned-mac-address=random\n")
+    run(["systemctl", "restart", "NetworkManager"])
+    flag("nm_mac", True)
+    log("NetworkManager persistent MAC randomization ON."); return 0
+
+
+def nm_mac_off():
+    if os.path.exists(NM_MAC_CONF): os.remove(NM_MAC_CONF)
+    run(["systemctl", "restart", "NetworkManager"])
+    flag("nm_mac", False); log("NetworkManager MAC randomization OFF."); return 0
+
+
+RAMWIPE_SVC = "/etc/systemd/system/hawkopsec-ramwipe.service"
+
+
+def ramwipe_on():
+    write_file(RAMWIPE_SVC,
+               "[Unit]\nDescription=HawkOpsec RAM wipe on shutdown\n"
+               "DefaultDependencies=no\nBefore=shutdown.target umount.target\n\n"
+               "[Service]\nType=oneshot\nRemainAfterExit=yes\n"
+               "ExecStart=/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches; "
+               "swapoff -a 2>/dev/null; command -v sdmem >/dev/null && sdmem -llv 2>/dev/null || true'\n\n"
+               "[Install]\nWantedBy=shutdown.target\n")
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "hawkopsec-ramwipe.service"])
+    flag("ramwipe", True)
+    log("RAM wipe on shutdown ENABLED (cold-boot mitigation)."); return 0
+
+
+def ramwipe_off():
+    run(["systemctl", "disable", "hawkopsec-ramwipe.service"])
+    if os.path.exists(RAMWIPE_SVC): os.remove(RAMWIPE_SVC)
+    run(["systemctl", "daemon-reload"])
+    flag("ramwipe", False); log("RAM wipe on shutdown DISABLED."); return 0
+
+
+# --------------------------------------------------------------------------- #
+#  Trace cleaning / journald
+# --------------------------------------------------------------------------- #
+def clean_system():
+    run(["journalctl", "--rotate"]); run(["journalctl", "--vacuum-time=1s"])
+    run(["resolvectl", "flush-caches"])          # visited domains in the DNS cache
+    if have("nscd"): run(["nscd", "-i", "hosts"])
+    if have("paccache"): run(["paccache", "-rk0"])
+    elif have("pacman"): run(["pacman", "-Scc", "--noconfirm"])
+    elif have("apt-get"): run(["apt-get", "clean"])
+    cd = "/var/lib/systemd/coredump"
+    if os.path.isdir(cd):
+        for f in os.listdir(cd):
+            try: os.remove(os.path.join(cd, f))
+            except OSError: pass
+    for w in ("/var/log/wtmp", "/var/log/btmp", "/var/log/lastlog"):
+        try: open(w, "w").close()
+        except OSError: pass
+    log("journals, DNS cache, coredumps, logins and package cache cleaned."); return 0
+
+
+JRN_DROPIN = "/etc/systemd/journald.conf.d/hawkopsec.conf"
+
+
+def journald_volatile():
+    write_file(JRN_DROPIN, "[Journal]\nStorage=volatile\n")
+    run(["systemctl", "restart", "systemd-journald"])
+    flag("journald_volatile", True); log("journald -> volatile (RAM only)."); return 0
+
+
+def journald_persistent():
+    if os.path.exists(JRN_DROPIN): os.remove(JRN_DROPIN)
+    run(["systemctl", "restart", "systemd-journald"])
+    flag("journald_volatile", False); log("journald storage restored."); return 0
+
+
+# --------------------------------------------------------------------------- #
+#  Panic
+# --------------------------------------------------------------------------- #
+def panic():
+    run(["nft", "-f", "-"], input_text="""
+table inet hawkopsec_panic {
+  chain input {
+    type filter hook input priority -300; policy drop;
+    iif lo accept
+  }
+  chain output {
+    type filter hook output priority -300; policy drop;
+    oif lo accept
+  }
+  chain forward {
+    type filter hook forward priority -300; policy drop;
+  }
+}
+""")
+    for i in net_ifaces(): run(["ip", "link", "set", "dev", i, "down"])
+    for n in PANIC_KILL: run(["pkill", "-9", "-x", n])
+    run(["sync"])
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f: f.write("3\n")
+    except OSError: pass
+    flag("panic", True); log("PANIC engaged."); return 0
+
+
+def panic_clear():
+    run(["nft", "delete", "table", "inet", "hawkopsec_panic"])
+    for i in net_ifaces(): run(["ip", "link", "set", "dev", i, "up"])
+    flag("panic", False); log("panic cleared, interfaces up."); return 0
+
+
+# --------------------------------------------------------------------------- #
+#  mode marker + master reset
+# --------------------------------------------------------------------------- #
+def set_mode(name):
+    flag("mode", name); log(f"mode -> {name}"); return 0
+
+
+def reset_all():
+    log("=== RESET: restoring pre-HawkOpsec state ===")
+    st = load_state()
+    steps = [
+        (panic_clear,         st.get("panic")),
+        (tor_off,             st.get("tor")),
+        (dns_restore,         st.get("dns")),
+        (firewall_off,        st.get("firewall")),
+        (ipv6_on,             st.get("ipv6_off")),
+        (unharden_sysctl,     st.get("sysctl")),
+        (telemetry_restore,   st.get("telemetry")),
+        (journald_persistent, st.get("journald_volatile")),
+        (usb_unlock,          st.get("usb_lock")),
+        (ramwipe_off,         st.get("ramwipe")),
+        (nm_mac_off,          st.get("nm_mac")),
+        (swap_on,             st.get("swap_off")),
+        (bluetooth_on,        st.get("bluetooth_off")),
+        (webcam_on,           st.get("webcam_off")),
+        (machineid_restore,   st.get("machineid")),
+        (hostname_restore,    st.get("hostname_orig")),
+        (tz_restore,          st.get("tz_orig")),
+        (mac_restore_all,     st.get("mac_orig")),
+    ]
+    for fn, cond in steps:
+        try:
+            if cond: fn()
+        except Exception as e: log(f"reset step error: {e}")
+    # Bring DNS / network back cleanly — but only if we actually touched them.
+    # Restarting NetworkManager unconditionally dropped the link for a few
+    # seconds after every BASELINE switch and broke the follow-up IP check.
+    if st.get("tor") or st.get("dns"):
+        run(["systemctl", "try-restart", "systemd-resolved"])   # only if it should run
+    if st.get("nm_mac") or st.get("mac_orig") or st.get("panic"):
+        run(["systemctl", "restart", "NetworkManager"])
+    try:
+        shutil.rmtree(BACKUP_DIR, ignore_errors=True)
+        if os.path.exists(STATE_FILE): os.remove(STATE_FILE)
+    except OSError: pass
+    ensure_dirs(); save_state({"mode": "BASELINE"})
+    log("=== RESET complete — system back to baseline ===")
+    return 0
+
+
+VERBS = {
+    "tor-on": tor_on, "tor-off": tor_off,
+    "dns-set": dns_set, "dns-restore": dns_restore,
+    "mac-random": mac_random, "mac-restore": mac_restore, "mac-restore-all": mac_restore_all,
+    "hostname-random": hostname_random, "hostname-restore": hostname_restore,
+    "tz-utc": tz_utc, "tz-restore": tz_restore,
+    "machineid-random": machineid_random, "machineid-restore": machineid_restore,
+    "harden-sysctl": harden_sysctl, "unharden-sysctl": unharden_sysctl,
+    "firewall-on": firewall_on, "firewall-off": firewall_off,
+    "telemetry-off": telemetry_off, "telemetry-restore": telemetry_restore,
+    "ipv6-off": ipv6_off, "ipv6-on": ipv6_on,
+    "bluetooth-off": bluetooth_off, "bluetooth-on": bluetooth_on,
+    "webcam-off": webcam_off, "webcam-on": webcam_on,
+    "swap-off": swap_off, "swap-on": swap_on,
+    "usb-lock": usb_lock, "usb-unlock": usb_unlock,
+    "nm-mac-on": nm_mac_on, "nm-mac-off": nm_mac_off,
+    "ramwipe-on": ramwipe_on, "ramwipe-off": ramwipe_off,
+    "clean-system": clean_system,
+    "journald-volatile": journald_volatile, "journald-persistent": journald_persistent,
+    "panic": panic, "panic-clear": panic_clear,
+    "set-mode": set_mode, "reset-all": reset_all,
+}
+
+
+def main():
+    if os.geteuid() != 0:
+        log("ERROR: helper must run as root (via pkexec)."); return 2
+    ensure_dirs()
+    if len(sys.argv) < 2 or sys.argv[1] not in VERBS:
+        log("usage: hawkopsec-helper <" + "|".join(VERBS) + ">"); return 2
+    verb, args = sys.argv[1], sys.argv[2:]
+    import fcntl
+    lock = open(os.path.join(STATE_DIR, ".lock"), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)          # serialize concurrent helper runs
+    try:
+        return VERBS[verb](*args) or 0
+    except TypeError as e:
+        log(f"bad arguments for {verb}: {e}"); return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

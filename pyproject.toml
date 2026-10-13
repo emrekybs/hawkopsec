@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hawkopsec"
+dynamic = ["version"]
+description = "One-tap Linux OPSEC hardening & anonymity toolkit — Tor routing, DNS/IP leak tests, identity spoofing, trace cleaning (PyQt6)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "EmreKybs" }]
+keywords = ["opsec", "privacy", "tor", "anonymity", "hardening", "dns-leak", "linux", "security"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Networking :: Firewalls",
+]
+dependencies = ["PyQt6>=6.6"]
+
+[project.urls]
+Homepage = "https://hawkopsec.com"
+Source = "https://github.com/emrekybs/hawkopsec"
+Issues = "https://github.com/emrekybs/hawkopsec/issues"
+
+[project.gui-scripts]
+hawkopsec = "hawkopsec.main:main"
+
+[project.scripts]
+hawkopsec-setup = "hawkopsec.setup_system:main"
+hawkopsec-leaktest = "hawkopsec.leaktest:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["hawkopsec*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "hawkopsec.__version__" }
+
+[tool.setuptools.package-data]
+hawkopsec = [
+    "hawkopsec-helper",
+    "assets/*.png",
+    "assets/fonts/*.ttf",
+    "assets/fonts/*.txt",
+    "assets/icons/*/*.png",
+    "data/*",
+]

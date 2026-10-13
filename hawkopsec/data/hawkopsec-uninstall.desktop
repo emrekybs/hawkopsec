@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=HawkOpsec Uninstall
+GenericName=Remove HawkOpsec
+Comment=Revert all changes and remove HawkOpsec completely
+Exec=pkexec /usr/local/lib/hawkopsec/uninstall
+Icon=hawkopsec
+Terminal=false
+Categories=System;Security;
+Keywords=uninstall;remove;hawkopsec;
+StartupNotify=true
